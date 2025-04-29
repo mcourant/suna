@@ -15,9 +15,9 @@ from agentpress.thread_manager import ThreadManager
 from services.supabase import DBConnection
 from services import redis
 from agent.run import run_agent
-from utils.auth_utils import get_current_user_id, get_user_id_from_stream_auth, verify_thread_access
+from utils.auth_utils import get_current_user_id_from_jwt, get_user_id_from_stream_auth, verify_thread_access
 from utils.logger import logger
-from utils.billing import check_billing_status, get_account_id_from_thread
+from services.billing import check_billing_status
 from sandbox.sandbox import create_sandbox, get_or_start_sandbox
 from services.llm import make_llm_api_call
 
@@ -34,6 +34,9 @@ MODEL_NAME_ALIASES = {
     "sonnet-3.7": "anthropic/claude-3-7-sonnet-latest",
     "gpt-4.1": "openai/gpt-4.1-2025-04-14",
     "gemini-flash-2.5": "openrouter/google/gemini-2.5-flash-preview",
+    "grok-3": "xai/grok-3-fast-latest",
+    "deepseek": "deepseek/deepseek-chat",
+    "grok-3-mini": "xai/grok-3-mini-fast-beta",
 }
 
 class AgentStartRequest(BaseModel):
@@ -224,7 +227,7 @@ async def _cleanup_redis_response_list(agent_run_id: str):
         logger.warning(f"Failed to set TTL on response list {response_list_key}: {str(e)}")
 
 async def restore_running_agent_runs():
-    """Mark agent runs that were still 'running' in the database as failed."""
+    """Mark agent runs that were still 'running' in the database as failed and clean up Redis resources."""
     logger.info("Restoring running agent runs after server restart")
     client = await db.client
     running_agent_runs = await client.table('agent_runs').select('id').eq("status", "running").execute()
@@ -232,6 +235,27 @@ async def restore_running_agent_runs():
     for run in running_agent_runs.data:
         agent_run_id = run['id']
         logger.warning(f"Found running agent run {agent_run_id} from before server restart")
+        
+        # Clean up Redis resources for this run
+        try:
+            # Clean up active run key
+            active_run_key = f"active_run:{instance_id}:{agent_run_id}"
+            await redis.delete(active_run_key)
+            
+            # Clean up response list
+            response_list_key = f"agent_run:{agent_run_id}:responses"
+            await redis.delete(response_list_key)
+            
+            # Clean up control channels
+            control_channel = f"agent_run:{agent_run_id}:control"
+            instance_control_channel = f"agent_run:{agent_run_id}:control:{instance_id}"
+            await redis.delete(control_channel)
+            await redis.delete(instance_control_channel)
+            
+            logger.info(f"Cleaned up Redis resources for agent run {agent_run_id}")
+        except Exception as e:
+            logger.error(f"Error cleaning up Redis resources for agent run {agent_run_id}: {e}")
+        
         # Call stop_agent_run to handle status update and cleanup
         await stop_agent_run(agent_run_id, error_message="Server restarted while agent was running")
 
@@ -293,7 +317,7 @@ async def get_or_create_project_sandbox(client, project_id: str):
 
     logger.info(f"Creating new sandbox for project {project_id}")
     sandbox_pass = str(uuid.uuid4())
-    sandbox = create_sandbox(sandbox_pass)
+    sandbox = create_sandbox(sandbox_pass, project_id)
     sandbox_id = sandbox.id
     logger.info(f"Created new sandbox {sandbox_id}")
 
@@ -324,7 +348,7 @@ async def get_or_create_project_sandbox(client, project_id: str):
 async def start_agent(
     thread_id: str,
     body: AgentStartRequest = Body(...),
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_from_jwt)
 ):
     """Start an agent for a specific thread in the background."""
     global instance_id # Ensure instance_id is accessible
@@ -388,7 +412,7 @@ async def start_agent(
     return {"agent_run_id": agent_run_id, "status": "running"}
 
 @router.post("/agent-run/{agent_run_id}/stop")
-async def stop_agent(agent_run_id: str, user_id: str = Depends(get_current_user_id)):
+async def stop_agent(agent_run_id: str, user_id: str = Depends(get_current_user_id_from_jwt)):
     """Stop a running agent."""
     logger.info(f"Received request to stop agent run: {agent_run_id}")
     client = await db.client
@@ -397,7 +421,7 @@ async def stop_agent(agent_run_id: str, user_id: str = Depends(get_current_user_
     return {"status": "stopped"}
 
 @router.get("/thread/{thread_id}/agent-runs")
-async def get_agent_runs(thread_id: str, user_id: str = Depends(get_current_user_id)):
+async def get_agent_runs(thread_id: str, user_id: str = Depends(get_current_user_id_from_jwt)):
     """Get all agent runs for a thread."""
     logger.info(f"Fetching agent runs for thread: {thread_id}")
     client = await db.client
@@ -407,7 +431,7 @@ async def get_agent_runs(thread_id: str, user_id: str = Depends(get_current_user
     return {"agent_runs": agent_runs.data}
 
 @router.get("/agent-run/{agent_run_id}")
-async def get_agent_run(agent_run_id: str, user_id: str = Depends(get_current_user_id)):
+async def get_agent_run(agent_run_id: str, user_id: str = Depends(get_current_user_id_from_jwt)):
     """Get agent run status and responses."""
     logger.info(f"Fetching agent run details: {agent_run_id}")
     client = await db.client
@@ -835,7 +859,7 @@ async def initiate_agent_with_files(
     stream: Optional[bool] = Form(True),
     enable_context_manager: Optional[bool] = Form(False),
     files: List[UploadFile] = File(default=[]),
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id_from_jwt)
 ):
     """Initiate a new agent session with optional file attachments."""
     global instance_id # Ensure instance_id is accessible
@@ -876,7 +900,6 @@ async def initiate_agent_with_files(
         logger.info(f"Using sandbox {sandbox_id} for new project {project_id}")
 
         # 4. Upload Files to Sandbox (if any)
-        # ... (File upload logic remains the same as in original file) ...
         message_content = prompt
         if files:
             successful_uploads = []
@@ -932,7 +955,6 @@ async def initiate_agent_with_files(
             if failed_uploads:
                 message_content += "\n\nThe following files failed to upload:\n"
                 for failed_file in failed_uploads: message_content += f"- {failed_file}\n"
-        # ... (End of file upload logic) ...
 
 
         # 5. Add initial user message to thread
