@@ -52,7 +52,11 @@ class Configuration:
     AWS_REGION_NAME: Optional[str] = None
     
     # Model configuration
-    MODEL_TO_USE: str = "anthropic/claude-3-7-sonnet-latest"
+    MODEL_TO_USE: str = "lm_studio/qwen3-30b-a3b-mlx"
+
+    # LM Studio configuration
+    LM_STUDIO_API_KEY: Optional[str] = None
+    LM_STUDIO_API_BASE: str = "http://localhost:1234/v1"
     
     # Supabase configuration
     SUPABASE_URL: Optional[str] = None
